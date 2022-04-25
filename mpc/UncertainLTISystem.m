@@ -45,9 +45,19 @@ classdef UncertainLTISystem < handle
             end
             
             D_A_dim = size(obj.A); D_B_dim = size(obj.B);
-            obj.DA_vertices = FindMatVertices(D_A_dim, obj.eps_A);
-            obj.DB_vertices = FindMatVertices(D_B_dim, obj.eps_B);
             
+            if isfield(params, 'Delta_A_vertices')
+                obj.DA_vertices = params.Delta_A_vertices;
+            else
+                obj.DA_vertices = FindMatVertices(D_A_dim, obj.eps_A);
+            end
+            
+            if isfield(params, 'Delta_B_vertices')
+                obj.DB_vertices = params.Delta_B_vertices;
+            else
+                obj.DB_vertices = FindMatVertices(D_B_dim, obj.eps_B);
+            end
+           
         end
         
         %% find local controller u = Kx through LQR
@@ -216,8 +226,8 @@ classdef UncertainLTISystem < handle
                 
                 diagnostic.runningStep = ii;
                
-                figure; Xinit.plot(); 
-                title(['step = ', num2str(ii), ' total step = ', num2str(Nstep)]);
+%                 figure; Xinit.plot(); 
+%                 title(['step = ', num2str(ii), ' total step = ', num2str(Nstep)]);
 %                 pause(0.5);
                 if options.robust == 0
                     preS = obj.preset(Xinit, Uc);
