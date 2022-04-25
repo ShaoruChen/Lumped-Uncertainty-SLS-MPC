@@ -7,6 +7,15 @@ classdef SLSMPC < handle
         uncertain_system;
         nx; nu; na; nb;
         eps_A; eps_B; sigma_w;
+        
+        % parameters for polytopic uncertainty
+        % Delta_A_vertices is a 1 x M_A cell that contains all M_A vertices of
+        % Delta_A, and so is Delta_B_vertices. The norm-bounded uncertainty
+        % parameters eps_A and eps_B are not used if Delta_A_vertices and
+        % Delta_B_vertices are initialized non-empty. 
+        Delta_A_vertices; Delta_B_vertices;
+        num_Delta_A_vertices; num_Delta_B_vertices;
+        
         x0; 
         x_eq; % goal state
         
@@ -31,6 +40,23 @@ classdef SLSMPC < handle
             obj.eps_B = params.eps_B;
             obj.sigma_w = params.sigma_w;
             
+            % when 
+            if isfield(params, 'Delta_A_vertices')
+                obj.Delta_A_vertices = params.Delta_A_vertices;
+                obj.num_Delta_A_vertices = length(obj.Delta_A_vertices);
+            else
+               obj.Delta_A_vertices = []; 
+               obj.num_Delta_A_vertices = 0;
+            end
+            
+            if isfield(params, 'Delta_B_vertices')
+                obj.Delta_B_vertices = params.Delta_B_vertices;
+                obj.num_Delta_B_vertices = length(obj.Delta_B_vertices);
+            else
+               obj.Delta_B_vertices = []; 
+               obj.num_Delta_B_vertices = 0;
+            end            
+
             obj.Q = params.Q;
             obj.R = params.R;
             % set the equilibrium point
@@ -651,7 +677,7 @@ classdef SLSMPC < handle
             sol.solver_time = solver_time + sol.solution.solvertime;
         end
         
-         %% tube MPC approach
+         %% tube MPC approach for norm-bounded model uncertainty
         function [sol] = SolveTubeMPC(obj, Z, type, verbose)
             % solve robust OCP through tube MPC
             % details see "Robust model predictive control using tubes" by
@@ -777,22 +803,7 @@ classdef SLSMPC < handle
                            - Az*zc{1} + max_W <= alpha{1}*bz];
                 end
             end
-            
-%             % construct cost function
-%             switch normType
-%                 case 2
-%                     cost_fcn = @(x,u) x'*Q*x + u'*R*u;
-%                     cost_terminal = @(x) x'*P*x;
-%                 case 1
-%                     cost_fcn = @(x,u) Q(1)*norm(x, 1) + R(1)*norm(u, 1);
-%                     cost_terminal = @(x) P(1)*norm(x, 1);
-%                 case Inf
-%                     cost_fcn = @(x,u) Q(1)*norm(x, Inf) + R(1)*norm(u, Inf);
-%                     cost_terminal = @(x) P(1)*norm(x, Inf);
-%                 otherwise
-%                     warning('The norm type has to be 1, 2, or Inf.\n');
-%             end
-            
+
             cost_fcn = @(x,u) x'*Q*x + u'*R*u;
             cost_terminal = @(x) x'*P*x;
                     
@@ -867,7 +878,11 @@ classdef SLSMPC < handle
 
         %% Monimoy's method implementation
         function [sol] = SolveUniformDistFeedbackMPC(obj, type, verbose)
-            % fixme: need to double check this
+            % Custom implementation of the robust MPC method proposed in "A Simple Robust
+            % MPC for Linear Systems with Parametric and Additive
+            % Uncertainty" by Monimoy Bujarbaruah, Ugo Rosolia, Yvonne R
+            % Stürz, Francesco Borrelli, 2021, ACC, which considers a uniform
+            % norm-bounded model uncertainty over-approximation. 
             
             if nargin < 2
                 type = 'value';
@@ -1229,6 +1244,479 @@ classdef SLSMPC < handle
             yalmip('clear');% clear all yalmip variables
         end
         
+        %% polytopic SLS MPC 
+        function [sol] = SolvePolytopicSLSMPC(obj, type, opt)
+            % Lumped uncertainty SLS MPC for systems with polytopic uncertainty
+            
+            fprintf('Solving polytopic SLS MPC started... \n');
+            
+            if nargin < 2
+                opt = struct;
+                opt.verbose = 2;
+                opt.solver = 'mosek';
+                opt.norm_type = inf;
+                type = 'value';
+            elseif nargin < 3
+                opt = struct;
+                opt.verbose = 2;
+                opt.solver = 'mosek';
+                opt.norm_type = inf;
+            end
+            
+            % norm-ball assumption on virtual disturbance
+            if isfield(opt, 'norm_type')
+                norm_type = opt.norm_type;
+            else
+                norm_type = inf;
+            end
+               
+            if norm_type == inf
+                constr_norm_type = 1;
+            else
+                error('Uncertainty over-approximation norm type not supported for full diagonal parameterization.');
+            end
+                
+            uncertain_system = obj.uncertain_system;
+            Ahat = uncertain_system.A; Bhat = uncertain_system.B;
+            nx = obj.nx; nu = obj.nu;
+            sigma_w = obj.sigma_w;
+            T = obj.horizon;
+            
+            x0 = obj.x0; 
+            Xc = obj.state_constr; 
+            Uc = obj.input_constr;
+            
+            Xf = obj.terminal_constr;
+            
+            if strcmp(type, 'value')
+                x0 = obj.x0;    
+            elseif strcmp(type, 'optimizer')
+                x0 = sdpvar(nx, 1);
+            end
+            
+            % vertices of Delta_A and Delta_B  
+            Delta_A_vertices = obj.Delta_A_vertices;
+            Delta_B_vertices = obj.Delta_B_vertices;
+            num_Delta_A_vertices = obj.num_Delta_A_vertices;
+            num_Delta_B_vertices = obj.num_Delta_B_vertices;
+            
+            if isempty(Delta_A_vertices) | isempty(Delta_B_vertices)
+                error('Please provide vertices for polytopic model uncertainty. \n');
+                return 
+            end
+          
+            % construct system response variables 
+			Phi_x = sdpvar( (T + 1) * nx, (T + 1) * nx, 'full');
+			Phi_u = sdpvar( (T + 1) * nu, (T + 1) * nx, 'full');
+            % extract matrix blocks
+            Phi = [Phi_x; Phi_u];
+  
+            % construct the sigma matrix
+            sigma_seq = sdpvar(1, T*nx);
+            Sigma_mat = sdpvar((T+1)*nx, (T+1)*nx, 'full');
+        
+            % Construct the objective function using nominal cost
+			sqrtQ = sqrtm(obj.Q);
+			sqrtR = sqrtm(obj.R);
+            sqrtQ_T = sqrtm(obj.Q_T);
+
+			Qset = cell(T + 1, 1); Rset = cell(T + 1, 1);
+
+			for i = 1 : T 
+				Qset{i} = sqrtQ;
+			end
+			Qset{T + 1} = sqrtQ_T;
+
+			for i = 1:T+1
+				Rset{i} = sqrtR;
+            end
+            
+            % attention: no penalty on u_T
+			Rset{T + 1} = zeros(size(sqrtR));
+                
+            % fixme: with full parameterization of Sigma, the
+            % interpretation of the transformed cost function is ambiguous.
+			cost = 0;
+            for i  = 1 : T+1
+                % attention: add reference target state
+                cost = cost + norm(Qset{i}*Phi_x((i - 1)*nx + 1: i*nx, 1:nx )*x0, 2)^2 ...
+                       + norm(Rset{i}*Phi_u((i - 1)*nu + 1: i*nu, 1:nx )*x0, 2)^2;      
+            end
+            
+            % add constraints to the problem
+            constr = [];
+            constr = [constr, sigma_seq >= 0];
+            
+            % Structure constraint of Phi_x and Phi_u
+			for k = 1 : T
+				constr = [constr, Phi_x( (k - 1)*nx + 1: k*nx, k*nx + 1: end) == zeros(nx, (T + 1 - k)*nx)];
+            end
+
+			for k = 1 : T
+				constr = [constr, Phi_u( (k - 1)*nu + 1: k*nu, k*nx + 1: end) == zeros(nu, (T + 1 - k)*nx)];
+            end
+            
+            % structure constraint on Sigma
+			for k = 1 : T
+				constr = [constr, Sigma_mat( (k - 1)*nx + 1: k*nx, k*nx + 1: end) == zeros(nx, (T + 1 - k)*nx)];
+            end
+
+            constr = [constr, Sigma_mat(1:nx, 1:nx) == eye(nx)];
+            for k = 1:T
+                constr = [constr, Sigma_mat(k*nx+1:(k+1)*nx, k*nx+1:(k+1)*nx) == diag(sigma_seq((k-1)*nx+1:k*nx))];
+            end
+            
+			Z = kron(diag(ones(1,T),-1), eye(nx));
+			ZA_block = Z*blkdiag(kron(eye(T), uncertain_system.A), zeros(nx, nx));
+            ZB_block = Z*blkdiag(kron(eye(T), uncertain_system.B), zeros(nx, nu));
+			Id = eye((T + 1)*nx);
+            % add affine constraint
+            constr = [constr, (Id - ZA_block)*Phi_x - ZB_block*Phi_u == Sigma_mat];
+
+            % state constraints
+			if ~isempty(obj.state_constr)
+				Fx = obj.state_constr.A; bx = obj.state_constr.b;
+				nFx = size(Fx, 1); nbx = length(bx);
+            else
+                warning('must have state constraints');
+            end
+            
+            for ii = 1:T
+               for jj = 1: nFx
+                  f = Fx(jj,:); b = bx(jj);
+                  LHS = f*Phi_x((ii-1)*nx+1:ii*nx,1:nx)*x0;
+                  for kk = 1:ii-1
+                      LHS = LHS + norm(f*Phi_x((ii-1)*nx+1:ii*nx,kk*nx+1:(kk+1)*nx), constr_norm_type);
+                  end
+                  constr = [constr, LHS <= b];  
+               end
+            end
+            
+            % terminal constraint   
+            if ~isempty(obj.terminal_constr)
+                Ft = obj.terminal_constr.A; bt = obj.terminal_constr.b;
+                nFt = size(Ft, 1); nbt = length(bt);
+            else 
+                Ft = Fx; bt = bx; nFt = nFx; nbt = nbx;
+            end
+           
+            
+            for jj = 1:nFt
+                f = Ft(jj,:); b = bt(jj);
+                LHS = f*Phi_x(T*nx+1:(T+1)*nx,1:nx)*x0;
+                for kk = 1:T
+                   LHS = LHS + norm(f*Phi_x(T*nx+1:(T+1)*nx,kk*nx+1:(kk+1)*nx),constr_norm_type);
+                end
+                constr = [constr, LHS <= b];
+            end
+            
+            % add input constraint
+            if ~isempty(obj.input_constr)
+				Fu = obj.input_constr.A; bu = obj.input_constr.b;
+				nFu = size(Fu, 1); nbu = length(bu);
+            else
+                warning('must have input constraints');
+            end
+            
+            for ii = 1:T+1
+               for jj = 1: nFu
+                  f = Fu(jj,:); b = bu(jj);
+                  LHS = f*Phi_u((ii-1)*nu+1:ii*nu,1:nx)*x0;
+                  for kk = 1:ii-1
+                      LHS = LHS + norm(f*Phi_u((ii-1)*nu+1:ii*nu,kk*nx+1:(kk+1)*nx),constr_norm_type);
+                  end
+                  constr = [constr, LHS <= b];  
+               end
+            end
+            
+            % signal containment constraint
+            eye_mat = eye(nx);
+            for ii = 1:T
+                for ii_Delta_A = 1:num_Delta_A_vertices
+                    Delta_A = Delta_A_vertices{ii_Delta_A};
+                    for ii_Delta_B = 1:num_Delta_B_vertices
+                        Delta_B = Delta_B_vertices{ii_Delta_B};
+
+                        for kk = 1:nx
+                            % row standard basis vector
+                            e_vec = eye_mat(kk, :);
+
+                            LHS = norm(e_vec*(Delta_A*Phi_x((ii-1)*nx+1:ii*nx, 1:nx) + ...
+                                    Delta_B*Phi_u((ii-1)*nu+1:ii*nu, 1:nx) - ...
+                                    Sigma_mat(ii*nx+1:(ii+1)*nx, 1:nx))*x0, norm_type);
+
+                            for jj = 1:ii-1
+                                % use constr_norm_type since we now bound
+                                % the norm of multiplication of two vectors
+                                LHS = LHS + norm(e_vec*(Delta_A*Phi_x((ii-1)*nx+1:ii*nx, jj*nx+1:(jj+1)*nx) +...
+                                    Delta_B*Phi_u((ii-1)*nu+1:ii*nu, jj*nx+1:(jj+1)*nx) - ...
+                                    Sigma_mat(ii*nx+1:(ii+1)*nx, jj*nx+1:(jj+1)*nx)), constr_norm_type);
+                            end
+                            constr = [constr, LHS + sigma_w <= sigma_seq((ii-1)*nx+kk)];
+                        end
+                    end
+                end     
+            end
+            
+             % solve the problem
+             if isfield(opt, 'solver')
+                 solver = opt.solver;
+             else
+                 solver = 'mosek';
+             end
+             
+             if isfield(opt, 'verbose')
+                 verbose = opt.verbose;
+             else
+                 verbose = 2;
+             end
+             
+			ops = sdpsettings('verbose', verbose, 'solver', solver);
+            
+            if strcmp(type, 'value')
+                solution = optimize(constr, cost, ops);
+            elseif strcmp(type, 'optimizer')
+                % the yalmip optimizer is returned
+                sol = optimizer(constr, cost, ops, x0, Phi_u(1:nu, 1:nx));
+                return
+            end
+                  
+			if solution.problem ~= 0
+				warning(['Numerical error detected. Error code ', num2str(solution.problem), '\n']);
+			end
+
+			sol = struct;
+			Phi_x_val = value(Phi_x); Phi_u_val = value(Phi_u);
+            Phi_u_val(find(isnan(Phi_u_val)==1)) = 0;
+            fval = value(cost);
+            sigma_seq_val = value(sigma_seq);
+            
+            sol.Phi_x = Phi_x_val; sol.Phi_u = Phi_u_val;
+            sol.fval = fval; 
+            sol.sigma_seq = sigma_seq_val;
+            sol.Sigma = value(Sigma_mat);
+            sol.status = solution.problem;
+            sol.solver_time = solution.solvertime;
+            sol.solution = solution;
+
+            obj.Phi_x = Phi_x_val; obj.Phi_u = Phi_u_val; obj.sigma_seq = sigma_seq_val;
+            yalmip('clear');% clear all yalmip variables
+        end
+        
+        %% tube MPC for polytopic model uncertainty
+        function [sol] = SolvePolytopicTubeMPC(obj, Z, type, opt)
+            % tube MPC approach with polytopic model uncertainty
+            % For details, see "Robust model predictive control using tubes" by
+            % W.Langson, I.Chryssochoos, S.V.Rakovic, D.Q.Mayne
+            % Z: a Polyhderon instance, the shape of the tube
+            % type = 'value' to find the solution of tube MPC
+            % type = 'optimizer' to generate a Yalmip optimizer with x_0 as
+            % the input parameter 
+            
+            if nargin < 3
+                type = 'value';
+                opt = struct;
+                opt.verbose = 0;
+                opt.solver = 'mosek';
+            elseif nargin < 4
+                 opt = struct;
+                opt.verbose = 0;
+                opt.solver = 'mosek';
+            end
+            
+            fprintf('Solving tube MPC started... \n');
+
+            uncertain_system = obj.uncertain_system;
+            Ahat = uncertain_system.A; Bhat = uncertain_system.B;
+            nx = obj.nx; nu = obj.nu;
+            Q = obj.Q; R = obj.R; P = obj.Q_T;
+            sigma_w = obj.sigma_w;
+            T = obj.horizon;
+            
+            x0 = obj.x0; 
+            Xc = obj.state_constr; 
+            Uc = obj.input_constr;
+            
+            % norm bounded disturbances
+            Wc = Polyhedron([eye(nx); -eye(nx)], [sigma_w*ones(nx,1); sigma_w*ones(nx, 1)]);
+            Xf = obj.terminal_constr;
+            
+            Aw = Wc.A; bw = Wc.b;
+
+            % shape of the tubes
+            Z_vertices = Z.V;
+            assert(size(Z_vertices,2) == nx);
+            
+            nJ = size(Z_vertices, 1);
+            % set of vertices of Z
+            Z_Vset = mat2cell(Z_vertices', [size(Z_vertices, 2)], ones(1, nJ));
+            
+            % find the H representation of Z
+            Az = Z.A; bz = Z.b;
+            assert(isempty(Z.Ae));
+            
+            % vertices of the inf-norm ball of Delta_A and Delta_B            
+            Delta_A_vertices = obj.Delta_A_vertices;
+            Delta_B_vertices = obj.Delta_B_vertices;
+            num_Delta_A_vertices = obj.num_Delta_A_vertices;
+            num_Delta_B_vertices = obj.num_Delta_B_vertices;
+            
+            if isempty(Delta_A_vertices) | isempty(Delta_B_vertices)
+                error('Please provide vertices for polytopic model uncertainty. \n');
+                return 
+            end
+            
+            % for computing the Minkowski difference
+            nz = size(Az, 1);
+            max_W = zeros(nz, 1);
+            if sigma_w ~= 0
+                opts = optimoptions(@linprog,'Display', 'off');
+                for ii = 1:nz
+                   [~, fval] = linprog(-Az(ii,:)', Aw, bw,[],[],[],[],opts );
+                   max_W(ii) = -fval;
+                end
+            end
+            
+           % create optimization variables
+           if strcmp(type, 'value')
+                x0 = obj.x0;    
+            elseif strcmp(type, 'optimizer')
+                x0 = sdpvar(nx, 1);
+           end
+            
+           if T > 1
+                alpha = sdpvar(ones(1,T), ones(1,T));
+           else
+               alpha = {sdpvar(1,1)};
+           end
+                
+            if T > 1
+                zc = sdpvar(repmat(nx, 1, T), repmat(1, 1, T));
+            else
+                zc = {sdpvar(repmat(nx, 1, T), repmat(1, 1, T))};
+            end
+            
+            u0 = sdpvar(nu, 1);
+            for ii = 1:T
+                % models {u_1, u_2, ..., u_T}
+                U{ii} = sdpvar(repmat(nu, 1, nJ), repmat(1, 1, nJ));
+                % X{i}{j}: the j-th vertex of the tube X_i
+                % X_i contains x_i in the prediction
+                X{ii} = sdpvar(repmat(nx, 1, nJ), repmat(1, 1, nJ));
+            end
+
+            for ii = 1:T
+                for jj = 1:nJ
+                   X{ii}{jj} = zc{ii} + alpha{ii}*Z_Vset{jj};
+                end
+            end
+            
+            % construct the optimization problem
+            fprintf('Constructing constraints ... \n');
+            F = [ismember(u0, Uc)];
+            % state and input constraints on tubes
+            for ii = 1:T
+                F = [F, alpha{ii} >= 0];
+                for jj = 1:nJ
+                   F = [F, ismember(X{ii}{jj}, Xc), ismember(U{ii}{jj}, Uc)];
+                   if ii == T & ~isempty(Xf)
+                      F = [F, ismember(X{ii}{jj}, Xf)]; 
+                   end
+                end
+            end
+            
+            % constrain the states for {x_2, ..., x_T} 
+            for ii_Delta_A  = 1:num_Delta_A_vertices
+                for ii_Delta_B = 1:num_Delta_B_vertices
+                   for ii = 1:T-1
+                      for jj = 1:nJ
+                        F = [F, Az*(Ahat + Delta_A_vertices{ii_Delta_A})*X{ii}{jj} + Az*(Bhat + Delta_B_vertices{ii_Delta_B})*U{ii}{jj}...
+                             - Az*zc{ii+1} + max_W <= alpha{ii+1}*bz];
+                      end          
+                   end
+                   % constrain the state for x_1
+                   F = [F, Az*(Ahat + Delta_A_vertices{ii_Delta_A})*x0 + Az*(Bhat + Delta_B_vertices{ii_Delta_B})*u0 ...
+                           - Az*zc{1} + max_W <= alpha{1}*bz];
+                end
+            end
+
+            cost_fcn = @(x,u) x'*Q*x + u'*R*u;
+            cost_terminal = @(x) x'*P*x;
+                    
+            fprintf('Constructing objective function... \n');
+            cost = cost_fcn(x0, u0);
+            for ii = 1:T-1
+                for jj = 1:nJ
+                    cost = cost + cost_fcn(X{ii}{jj}, U{ii}{jj});
+                end
+            end
+            % add terminal cost
+            if ~isempty(P)
+                for jj = 1:nJ
+                   cost = cost + cost_terminal(X{T}{jj}); 
+                end
+            end
+            cost = cost/(nJ*T);
+            
+            options = sdpsettings('solver', opt.solver, 'verbose', opt.verbose);
+            sol = struct;
+            
+            fprintf('Solver started...\n');
+            
+            if strcmp(type, 'value')
+                diagnostics = optimize(F, cost);
+            elseif strcmp(type, 'optimizer')
+                % the yalmip optimizer is returned
+                sol = optimizer(F, cost, options, x0, U{1});
+                return
+            end
+                        
+            % extract the tubes
+            tubes = cell(1, T);
+            for ii = 1:T
+                tubes{ii} = value(zc{ii}) + value(alpha{ii})*Z;
+            end
+            
+            % extract the vertices
+            vertices_set = cell(1, T);
+            for ii = 1:T
+               vertices = cell(1, nJ);
+               for jj = 1:nJ
+                  vertices{jj} = value(X{ii}{jj}); 
+               end
+               vertices_set{ii} = vertices;
+            end
+            
+            % extract the control inputs
+            u_tubes = cell(1,T);
+            for ii = 1:T
+                vertex_input = cell(1, nJ);
+                for jj = 1:nJ
+                    vertex_input{jj} = value(U{ii}{jj});
+                end
+               u_tubes{ii} = vertex_input; 
+            end
+            
+            % save the solution
+            sol.diagnostics = diagnostics;
+            sol.solver_time = diagnostics.solvertime;
+            sol.objective = value(cost);
+            sol.u0 = value(u0);
+            sol.x0 = x0;
+            sol.tubes = tubes;   
+            sol.u_tubes = u_tubes;
+            sol.vertices_set = vertices_set;
+            sol.status = diagnostics.problem;
+            
+            alpha_value = zeros(1, T);
+            for ii = 1:T
+                alpha_value(ii) = value(alpha{ii});
+            end
+            sol.alpha = alpha_value;  
+            
+            yalmip('clear');
+        end
+
         %% simulate trajectories in prediction 
         function [traj_set] = SimulateTrajwithSystemResponses(obj, num_traj)
             % simulate the closed-loop trajectories in prediction using the
@@ -1255,8 +1743,16 @@ classdef SLSMPC < handle
                DeltaA_seq = cell(1, T); DeltaB_seq = cell(1, T);
                xsls = x0;
                
-               Delta_A = DeltaOperator(nx, nx, 1, eps_A, 0);
-               Delta_B = DeltaOperator(nx, nu, 1, eps_B, 0);
+               if strcmp(opt, 'norm-bounded')
+                   Delta_A = DeltaOperator(nx, nx, 1, eps_A, 0);
+                   Delta_B = DeltaOperator(nx, nu, 1, eps_B, 0);
+               elseif strcmp(opt, 'polytopic')
+                   Delta_A = SamplePolyUncertainty(obj.Delta_A_vertices);
+                   Delta_B = SamplePolyUncertainty(obj.Delta_B_vertices);
+               else
+                   error('Model uncertainty type not supported.\n');
+               end
+               
                for jj = 1:T
                    w = rand(nx,1).*2*sigma_w - sigma_w;           
                    w_seq = [w_seq w];
