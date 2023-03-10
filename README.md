@@ -1,6 +1,6 @@
 # Lumped-Uncertainty-SLS-MPC
 
-**Update: A more recent and structured implementation of SLS MPC can be found in [Polytopic-SLSMPC](https://github.com/ShaoruChen/Polytopic-SLSMPC) together with several other robust MPC baselines.**
+**Update: A more recent and structured implementation of SLS MPC can be found in [Polytopic-SLSMPC](https://github.com/ShaoruChen/Polytopic-SLSMPC) together with several other robust MPC baselines (tube-based and LTV state feedback-based).**
 
 This repo. contains the codes for implementing the robust model predictive control (MPC) methods used in the paper [System Level Synthesis-based Robust Model Predictive
 Control through Convex Inner Approximation](https://arxiv.org/pdf/2111.05509.pdf) which considers **norm-bounded** model uncertainty:
